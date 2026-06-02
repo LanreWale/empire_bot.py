@@ -286,6 +286,94 @@ def start_health_server():
     from flask import Flask
     app = Flask(__name__)
 
+    # --- NEW HOMEPAGE DASHBOARD ---
+    @app.route('/')
+    def home():
+        return '''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Empire Trading Bot - Command Center</title>
+            <style>
+                body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 0; background: linear-gradient(135deg, #0a0e27 0%, #1a1f3a 100%); color: #e0e0e0; min-height: 100vh; }
+                .header { background: rgba(0, 0, 0, 0.3); padding: 20px 40px; border-bottom: 1px solid rgba(255, 215, 0, 0.3); }
+                h1 { margin: 0; background: linear-gradient(135deg, #ffd700, #ff8c00); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+                .subtitle { color: #888; margin-top: 5px; }
+                .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+                .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 20px; margin-bottom: 20px; }
+                .card { background: rgba(255, 255, 255, 0.05); border-radius: 15px; padding: 20px; backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); }
+                .card h2 { color: #ffd700; margin-top: 0; border-left: 3px solid #ffd700; padding-left: 10px; }
+                .status-badge { display: inline-block; padding: 5px 12px; border-radius: 20px; font-size: 12px; font-weight: bold; margin-right: 10px; }
+                .status-live { background: rgba(255, 68, 68, 0.2); color: #ff4444; border: 1px solid #ff4444; }
+                .status-good { background: rgba(0, 255, 136, 0.2); color: #00ff88; border: 1px solid #00ff88; }
+                .endpoint-list { list-style: none; padding: 0; }
+                .endpoint-list li { padding: 10px; border-bottom: 1px solid rgba(255,255,255,0.1); }
+                .endpoint-list li a { color: #00ff88; text-decoration: none; font-family: monospace; }
+                .endpoint-list li a:hover { text-decoration: underline; }
+                .watchlist { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
+                .watchlist-item { background: rgba(0,0,0,0.3); padding: 8px 15px; border-radius: 20px; font-size: 14px; }
+                .footer { text-align: center; padding: 20px; background: rgba(0, 0, 0, 0.3); margin-top: 20px; font-size: 12px; color: #666; }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>🏛️ Empire Trading Command Center</h1>
+                <div class="subtitle">Welcome back, Emperor. Your empire awaits.</div>
+            </div>
+            <div class="container">
+                <div class="grid">
+                    <div class="card">
+                        <h2>📊 System Status</h2>
+                        <p><span class="status-badge status-live">🔴 LIVE TRADING</span> <span class="status-badge status-good">🤖 BOT RUNNING</span></p>
+                        <p><strong>Data Source:</strong> Alpha Vantage</p>
+                        <p><strong>Scan Interval:</strong> ''' + str(SCAN_INTERVAL) + ''' seconds</p>
+                        <p><strong>Watchlist Size:</strong> ''' + str(len(WATCHLIST)) + ''' symbols</p>
+                        <p><strong>Last Check:</strong> <span id="timestamp">Loading...</span></p>
+                    </div>
+                    <div class="card">
+                        <h2>📋 Active Watchlist</h2>
+                        <div class="watchlist">
+                            ''' + ''.join([f'<div class="watchlist-item">{s[0]}</div>' for s in WATCHLIST]) + '''
+                        </div>
+                        <p style="margin-top: 15px; color: #888;">Strategies: Momentum, Breakout, Mean Reversion, Swing</p>
+                    </div>
+                </div>
+                <div class="grid">
+                    <div class="card">
+                        <h2>🔗 API Endpoints</h2>
+                        <ul class="endpoint-list">
+                            <li><a href="/health">🔍 /health</a> - Bot health check</li>
+                            <li><a href="/account">💰 /account</a> - Account information</li>
+                            <li><a href="/positions">📈 /positions</a> - Open positions</li>
+                            <li><a href="/orders">📜 /orders</a> - Order history</li>
+                            <li><a href="/quote/AAPL">💹 /quote/&lt;symbol&gt;</a> - Stock quote (AAPL example)</li>
+                        </ul>
+                    </div>
+                    <div class="card">
+                        <h2>⚙️ Configuration</h2>
+                        <p><strong>Alpha Vantage:</strong> ✅ Configured</p>
+                        <p><strong>Alpaca API:</strong> ✅ Configured</p>
+                        <p><strong>Telegram:</strong> ''' + ('✅ Configured' if TG_TOKEN and TG_CHAT else '⚠️ Not configured') + '''</p>
+                        <p><strong>Rate Limit:</strong> 5 calls/minute (12s delay between symbols)</p>
+                        <p><strong>Max Position:</strong> $500 per trade</p>
+                        <p><strong>Min Confidence:</strong> 75%</p>
+                    </div>
+                </div>
+            </div>
+            <div class="footer">
+                <p>⚡ Empire Trading Bot | Live 24/7 | Deployed on Render.com</p>
+                <p style="font-size: 11px;">Alpha Vantage Free Tier | ⚠️ REAL MONEY IS BEING TRADED</p>
+            </div>
+            <script>
+                document.getElementById('timestamp').innerHTML = new Date().toLocaleString();
+                setInterval(() => {
+                    document.getElementById('timestamp').innerHTML = new Date().toLocaleString();
+                }, 1000);
+            </script>
+        </body>
+        </html>
+        '''
+
     @app.route('/health')
     def health():
         return {
