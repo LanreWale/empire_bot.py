@@ -1,29 +1,23 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║          EMPIRE STOCK TRADING SYSTEM — 24/7 Cloud Bot           ║
-║          Deploy on Render.com (Free tier works!)                ║
+║          EMPIRE STOCK TRADING SYSTEM — LIVE TRADING             ║
+║          Deployed on Render.com - 24/7 Automated Bot            ║
 ║                                                                  ║
-║  SETUP:                                                          ║
-║  1. Create a new Web Service on Render.com                       ║
-║  2. Connect your GitHub repo (or paste this file)               ║
-║  3. Set environment variables (see below)                        ║
-║  4. Deploy — it runs forever, 24/7                               ║
+║  ⚠️  LIVE TRADING MODE - Real money will be used!              ║
+║  ⚠️  Ensure sufficient funds in your Alpaca account            ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 REQUIRED ENV VARS on Render:
-  ALPACA_API_KEY       — Your Alpaca live API key
-  ALPACA_SECRET_KEY    — Your Alpaca live secret key
-  ALPACA_BASE_URL      — https://api.alpaca.markets (or paper-api for testing)
-  TELEGRAM_BOT_TOKEN   — Telegram bot token (optional, for alerts)
-  TELEGRAM_CHAT_ID     — Your Telegram chat ID (optional)
+  ALPACA_API_KEY       — Your Alpaca LIVE API key
+  ALPACA_SECRET_KEY    — Your Alpaca LIVE secret key
+  ALPACA_BASE_URL      — https://api.alpaca.markets (LIVE)
+  TELEGRAM_BOT_TOKEN   — Telegram bot token (strongly recommended)
+  TELEGRAM_CHAT_ID     — Your Telegram chat ID
   SCAN_INTERVAL_SECONDS — Seconds between scans (default: 300)
 
 OPTIONAL ENV VARS:
   MAX_POSITION_USD     — Max USD per trade (default: 500)
   MIN_CONFIDENCE       — Minimum confidence to trade (default: 75)
-
-INSTALL: pip install alpaca-trade-api requests flask yfinance
-START CMD on Render: python empire_bot.py
 """
 
 import os
@@ -49,7 +43,7 @@ log = logging.getLogger('EmpireBot')
 # ── Environment Variables ──────────────────────────────────────────────────────
 ALPACA_KEY = os.environ.get('ALPACA_API_KEY', '')
 ALPACA_SECRET = os.environ.get('ALPACA_SECRET_KEY', '')
-ALPACA_URL = os.environ.get('ALPACA_BASE_URL', 'https://paper-api.alpaca.markets')  # Default to paper trading for safety
+ALPACA_URL = os.environ.get('ALPACA_BASE_URL', 'https://api.alpaca.markets')  # LIVE
 TG_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TG_CHAT = os.environ.get('TELEGRAM_CHAT_ID', '')
 
@@ -220,7 +214,13 @@ def market_is_open() -> bool:
     try:
         clock = alpaca_get('/v2/clock')
         is_open = clock.get('is_open', False)
-        log.info(f'Market is {"OPEN" if is_open else "CLOSED"}')
+        next_open = clock.get('next_open', 'unknown')
+        next_close = clock.get('next_close', 'unknown')
+        
+        if is_open:
+            log.info('📈 Market is OPEN')
+        else:
+            log.info(f'🔒 Market is CLOSED. Next open: {next_open}')
         return is_open
     except Exception as e:
         log.warning(f'Could not check market hours: {e}')
@@ -286,26 +286,28 @@ def send_telegram(message: str) -> None:
     except Exception as e:
         log.warning(f'Telegram error: {e}')
 
-# ── Daily Summary ─────────────────────────────────────────────────────────────
-def send_daily_summary() -> None:
-    """Send daily P&L summary at market close."""
+# ── Account Summary ─────────────────────────────────────────────────────────
+def send_account_summary() -> None:
+    """Send current account status."""
     try:
         account = get_account()
         equity = float(account.get('equity', 0))
+        cash = float(account.get('cash', 0))
         buying_power = float(account.get('buying_power', 0))
         daily_pnl = float(account.get('daily_pnl', 0))
         
         message = (
-            f'📊 <b>Empire Bot Daily Summary</b>\n'
+            f'💰 <b>Empire Bot Account Status</b>\n'
             f'┌─────────────────────┐\n'
-            f'│ Equity:     ${equity:,.2f}\n'
-            f'│ Daily P&L:  {"+" if daily_pnl >= 0 else ""}${daily_pnl:,.2f}\n'
+            f'│ Equity:      ${equity:,.2f}\n'
+            f'│ Cash:        ${cash:,.2f}\n'
             f'│ Buying Power: ${buying_power:,.2f}\n'
+            f'│ Daily P&L:   {"+" if daily_pnl >= 0 else ""}${daily_pnl:,.2f}\n'
             f'└─────────────────────┘'
         )
         send_telegram(message)
     except Exception as e:
-        log.error(f'Failed to send daily summary: {e}')
+        log.error(f'Failed to send account summary: {e}')
 
 # ── Main Scan Loop ────────────────────────────────────────────────────────────
 def run_scan() -> None:
@@ -352,6 +354,15 @@ def run_scan() -> None:
             # Calculate quantity to trade
             qty = max(1, int(max_pos / current_price))
             
+            # Get account buying power to ensure we can trade
+            account = get_account()
+            buying_power = float(account.get('buying_power', 0))
+            order_value = qty * current_price
+            
+            if order_value > buying_power:
+                log.warning(f'{symbol}: Order value ${order_value:,.2f} exceeds buying power ${buying_power:,.2f}')
+                continue
+            
             # Place the order
             order = place_bracket_order(symbol, qty, action, current_price, sl_pct, tp_pct)
             
@@ -368,9 +379,10 @@ def run_scan() -> None:
             
             # Send Telegram alert
             alert = (
-                f'🤖 <b>Empire Bot Trade Executed</b>\n'
+                f'🔥 <b>LIVE TRADE EXECUTED</b>\n'
                 f'{"🟢 BUY" if action == "buy" else "🔴 SELL"} <b>{qty}x {symbol}</b>\n'
                 f'💰 Price: ${current_price:.2f}\n'
+                f'💵 Value: ${order_value:,.2f}\n'
                 f'📉 Stop Loss: ${stop_price} ({sl_pct:.1f}%)\n'
                 f'📈 Take Profit: ${target_price} ({tp_pct:.1f}%)\n'
                 f'🎯 Strategy: {strategy} | Confidence: {confidence}%\n'
@@ -386,13 +398,9 @@ def run_scan() -> None:
             
         except Exception as e:
             log.error(f'{symbol}: Error processing - {e}')
+            send_telegram(f'⚠️ <b>Error processing {symbol}</b>\n{str(e)[:200]}')
     
     log.info(f'─── Scan complete. {executed_orders} order(s) placed ───')
-    
-    # Send daily summary at market close (around 4 PM ET = 20:00 UTC)
-    current_hour = datetime.now(timezone.utc).hour
-    if current_hour == 20 and executed_orders == 0:
-        send_daily_summary()
 
 # ── Health Check Server (Keeps Render awake) ──────────────────────────────────
 def start_health_server() -> None:
@@ -403,16 +411,17 @@ def start_health_server() -> None:
     def health():
         return jsonify({
             'status': 'running',
-            'bot': 'Empire Trading Bot',
+            'bot': 'Empire Trading Bot - LIVE',
             'time': datetime.now(timezone.utc).isoformat(),
-            'version': '2.0'
+            'version': '2.0-live'
         })
     
     @app.route('/')
     def home():
         return jsonify({
-            'message': 'Empire Trading Bot is running',
-            'endpoints': ['/health', '/account', '/positions', '/orders', '/quote/<symbol>']
+            'message': 'Empire Trading Bot is running in LIVE mode',
+            'endpoints': ['/health', '/account', '/positions', '/orders', '/quote/<symbol>', '/scan'],
+            'warning': '⚠️ REAL MONEY IS BEING TRADED ⚠️'
         })
     
     @app.route('/account')
@@ -450,7 +459,6 @@ def start_health_server() -> None:
     def manual_scan():
         """Manually trigger a scan cycle."""
         try:
-            # Run scan in background thread to not block response
             thread = threading.Thread(target=run_scan)
             thread.start()
             return jsonify({'message': 'Scan triggered'}), 202
@@ -463,7 +471,8 @@ def start_health_server() -> None:
 
 # ── Main Entry Point ──────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    log.info('🚀 Empire Trading Bot starting...')
+    log.info('🚀 Empire Trading Bot starting in LIVE mode...')
+    log.warning('⚠️  ⚠️  ⚠️  LIVE TRADING ACTIVE - REAL MONEY WILL BE USED ⚠️  ⚠️  ⚠️')
     log.info(f'📊 Watchlist: {len(WATCHLIST)} symbols')
     log.info(f'⏱️  Scan interval: {SCAN_INTERVAL} seconds')
     log.info(f'💰 Max position: ${MAX_POSITION_USD:,.2f}')
@@ -475,24 +484,32 @@ if __name__ == '__main__':
         log.error('Please add these environment variables in Render dashboard')
         exit(1)
     
-    # Show which Alpaca environment we're using
-    if 'paper' in ALPACA_URL:
-        log.info('📝 Running in PAPER TRADING mode')
+    # Verify we're using live endpoint
+    if 'paper' in ALPACA_URL.lower():
+        log.error('❌ ALPACA_BASE_URL is set to paper trading but you requested live trading!')
+        log.error('Please set ALPACA_BASE_URL=https://api.alpaca.markets')
+        exit(1)
     else:
-        log.warning('⚠️  Running in LIVE TRADING mode!')
+        log.warning('🔴 RUNNING IN LIVE TRADING MODE - REAL MONEY')
+    
+    # Send startup notification with account summary
+    send_telegram(
+        f'🔥 <b>Empire Trading Bot - LIVE MODE ACTIVATED</b>\n'
+        f'⚠️ <b>REAL MONEY IS BEING TRADED</b>\n'
+        f'📊 Watchlist: {len(WATCHLIST)} symbols\n'
+        f'⏱️  Scan every {SCAN_INTERVAL} seconds\n'
+        f'💰 Max position: ${MAX_POSITION_USD:,.2f}\n'
+        f'🎯 Min confidence: {MIN_CONFIDENCE}%'
+    )
+    
+    # Send initial account status
+    time.sleep(2)
+    send_account_summary()
     
     # Start health server in background
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
     time.sleep(2)  # Allow server to start
-    
-    # Send startup notification
-    send_telegram(
-        f'🤖 <b>Empire Trading Bot Started</b>\n'
-        f'📊 Watchlist: {len(WATCHLIST)} symbols\n'
-        f'⏱️  Scan every {SCAN_INTERVAL} seconds\n'
-        f'{"📝 PAPER TRADING" if "paper" in ALPACA_URL else "💰 LIVE TRADING"}'
-    )
     
     # Run initial scan
     log.info('Running initial scan...')
