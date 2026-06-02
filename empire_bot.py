@@ -13,20 +13,32 @@
 REQUIRED ENV VARS on Render:
   ALPACA_API_KEY       — Your Alpaca live API key
   ALPACA_SECRET_KEY    — Your Alpaca live secret key
-  ALPACA_BASE_URL      — https://api.alpaca.markets
-  ALPHAVANTAGE_KEY     — Alpha Vantage API key (for quotes)
+  ALPACA_BASE_URL      — https://api.alpaca.markets (or paper-api for testing)
   TELEGRAM_BOT_TOKEN   — Telegram bot token (optional, for alerts)
   TELEGRAM_CHAT_ID     — Your Telegram chat ID (optional)
+  SCAN_INTERVAL_SECONDS — Seconds between scans (default: 300)
 
-INSTALL: pip install alpaca-trade-api requests flask
+OPTIONAL ENV VARS:
+  MAX_POSITION_USD     — Max USD per trade (default: 500)
+  MIN_CONFIDENCE       — Minimum confidence to trade (default: 75)
+
+INSTALL: pip install alpaca-trade-api requests flask yfinance
 START CMD on Render: python empire_bot.py
 """
 
-import os, time, logging, threading, json
+import os
+import time
+import logging
+import threading
+import json
 from datetime import datetime, timezone
-import requests
+from typing import Dict, Optional, Set, Tuple
 
-# ── Logging ────────────────────────────────────────────────────────────────────
+import requests
+import yfinance as yf
+from flask import Flask, request as flask_request, jsonify
+
+# ── Logging Configuration ──────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -34,260 +46,460 @@ logging.basicConfig(
 )
 log = logging.getLogger('EmpireBot')
 
-# ── Config from environment ────────────────────────────────────────────────────
-ALPACA_KEY    = os.environ.get('ALPACA_API_KEY', '')
+# ── Environment Variables ──────────────────────────────────────────────────────
+ALPACA_KEY = os.environ.get('ALPACA_API_KEY', '')
 ALPACA_SECRET = os.environ.get('ALPACA_SECRET_KEY', '')
-ALPACA_URL    = os.environ.get('ALPACA_BASE_URL', 'https://api.alpaca.markets')
-AV_KEY        = os.environ.get('ALPHAVANTAGE_KEY', '')
-TG_TOKEN      = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-TG_CHAT       = os.environ.get('TELEGRAM_CHAT_ID', '')
-SCAN_INTERVAL = int(os.environ.get('SCAN_INTERVAL_SECONDS', '300'))  # 5 min default
+ALPACA_URL = os.environ.get('ALPACA_BASE_URL', 'https://paper-api.alpaca.markets')  # Default to paper trading for safety
+TG_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TG_CHAT = os.environ.get('TELEGRAM_CHAT_ID', '')
 
-# ── Watchlist — mirrors your app strategies ────────────────────────────────────
-# Add/remove symbols as needed. Format: (symbol, strategy, max_position_usd, sl_pct, tp_pct)
+# Parse scan interval with error handling
+try:
+    SCAN_INTERVAL = int(os.environ.get('SCAN_INTERVAL_SECONDS', '300'))
+except ValueError:
+    log.warning("Invalid SCAN_INTERVAL_SECONDS, using default 300")
+    SCAN_INTERVAL = 300
+
+# Trading parameters
+MAX_POSITION_USD = float(os.environ.get('MAX_POSITION_USD', '500'))
+MIN_CONFIDENCE = int(os.environ.get('MIN_CONFIDENCE', '75'))
+
+# ── Watchlist Configuration ────────────────────────────────────────────────────
+# Format: (symbol, strategy, max_position_usd, stop_loss_percent, take_profit_percent)
 WATCHLIST = [
-    ('AAPL',  'momentum',      500, 2.0, 4.0),
-    ('TSLA',  'momentum',      500, 2.5, 5.0),
-    ('NVDA',  'breakout',      500, 2.0, 5.0),
-    ('MSFT',  'mean_reversion',500, 2.0, 4.0),
-    ('AMZN',  'swing',         500, 2.0, 4.0),
-    ('GOOGL', 'momentum',      500, 2.0, 4.0),
-    ('META',  'breakout',      500, 2.5, 5.0),
-    ('SPY',   'mean_reversion',500, 1.5, 3.0),
+    ('AAPL', 'momentum', MAX_POSITION_USD, 2.0, 4.0),
+    ('TSLA', 'momentum', MAX_POSITION_USD, 2.5, 5.0),
+    ('NVDA', 'breakout', MAX_POSITION_USD, 2.0, 5.0),
+    ('MSFT', 'mean_reversion', MAX_POSITION_USD, 2.0, 4.0),
+    ('AMZN', 'swing', MAX_POSITION_USD, 2.0, 4.0),
+    ('GOOGL', 'momentum', MAX_POSITION_USD, 2.0, 4.0),
+    ('META', 'breakout', MAX_POSITION_USD, 2.5, 5.0),
+    ('SPY', 'mean_reversion', MAX_POSITION_USD, 1.5, 3.0),
 ]
 
+# ── Alpaca API Headers ─────────────────────────────────────────────────────────
 HEADERS = {
-    'APCA-API-KEY-ID':     ALPACA_KEY,
+    'APCA-API-KEY-ID': ALPACA_KEY,
     'APCA-API-SECRET-KEY': ALPACA_SECRET,
-    'Content-Type':        'application/json',
+    'Content-Type': 'application/json',
 }
 
-# ── Alpaca helpers ─────────────────────────────────────────────────────────────
-def alpaca_get(path):
-    r = requests.get(f'{ALPACA_URL}{path}', headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    return r.json()
+# ── Alpaca API Helpers ─────────────────────────────────────────────────────────
+def alpaca_get(path: str) -> Dict:
+    """Make GET request to Alpaca API."""
+    try:
+        response = requests.get(f'{ALPACA_URL}{path}', headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        log.error(f'Alpaca GET failed: {e}')
+        raise
 
-def alpaca_post(path, body):
-    r = requests.post(f'{ALPACA_URL}{path}', headers=HEADERS,
-                      data=json.dumps(body), timeout=10)
-    r.raise_for_status()
-    return r.json()
+def alpaca_post(path: str, body: Dict) -> Dict:
+    """Make POST request to Alpaca API."""
+    try:
+        response = requests.post(f'{ALPACA_URL}{path}', headers=HEADERS,
+                                data=json.dumps(body), timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        log.error(f'Alpaca POST failed: {e}')
+        raise
 
-def get_account():
+def get_account() -> Dict:
+    """Get account information."""
     return alpaca_get('/v2/account')
 
-def get_positions():
-    return alpaca_get('/v2/positions')
-
-def place_bracket_order(symbol, qty, side, price, sl_pct, tp_pct):
-    sl = round(price * (1 - sl_pct/100) if side == 'buy' else price * (1 + sl_pct/100), 2)
-    tp = round(price * (1 + tp_pct/100) if side == 'buy' else price * (1 - tp_pct/100), 2)
-    body = {
-        'symbol':      symbol,
-        'qty':         str(qty),
-        'side':        side,
-        'type':        'market',
-        'time_in_force': 'gtc',
-        'order_class': 'bracket',
-        'stop_loss':   {'stop_price': str(sl)},
-        'take_profit': {'limit_price': str(tp)},
-    }
-    return alpaca_post('/v2/orders', body)
-
-# ── Market data ────────────────────────────────────────────────────────────────
-def get_quote(symbol):
-    """Fetch live quote from Alpha Vantage."""
-    if not AV_KEY:
-        return None
-    url = (f'https://www.alphavantage.co/query?function=GLOBAL_QUOTE'
-           f'&symbol={symbol}&apikey={AV_KEY}')
-    r = requests.get(url, timeout=10)
-    data = r.json().get('Global Quote', {})
-    if not data:
-        return None
-    return {
-        'price':          float(data.get('05. price', 0)),
-        'change_pct':     float(data.get('10. change percent', '0%').replace('%', '')),
-        'volume':         int(data.get('06. volume', 0)),
-    }
-
-# ── Market hours check ─────────────────────────────────────────────────────────
-def market_is_open():
+def get_positions() -> list:
+    """Get all open positions."""
     try:
-        clock = alpaca_get('/v2/clock')
-        return clock.get('is_open', False)
+        return alpaca_get('/v2/positions')
     except:
-        return True  # fail open — let Alpaca reject if truly closed
+        return []
 
-# ── Signal generation (mirrors frontend logic) ─────────────────────────────────
-def generate_signal(strategy, quote):
-    chg = quote['change_pct']
-    vol = quote['volume']
-
-    if strategy == 'momentum':
-        if chg > 1.5:  return ('buy',  min(95, int(60 + chg * 8)), f'Momentum +{chg:.2f}%')
-        if chg < -1.5: return ('sell', min(95, int(60 + abs(chg) * 8)), f'Momentum {chg:.2f}%')
-    elif strategy == 'mean_reversion':
-        if chg < -2.5: return ('buy',  78, f'Oversold {chg:.2f}%')
-        if chg >  2.5: return ('sell', 78, f'Overbought +{chg:.2f}%')
-    elif strategy == 'breakout':
-        if chg >  2.0 and vol > 5_000_000: return ('buy',  85, f'Breakout vol {vol/1e6:.1f}M')
-        if chg < -2.0 and vol > 5_000_000: return ('sell', 80, f'Breakdown vol {vol/1e6:.1f}M')
-    elif strategy == 'swing':
-        if chg >  1.0: return ('buy',  72, f'Swing entry +{chg:.2f}%')
-        if chg < -1.0: return ('sell', 72, f'Swing exit {chg:.2f}%')
-
-    return ('hold', 40, 'No signal')
-
-# ── Telegram alerts ────────────────────────────────────────────────────────────
-def send_telegram(msg):
-    if not TG_TOKEN or not TG_CHAT:
-        return
-    try:
-        requests.post(
-            f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
-            json={'chat_id': TG_CHAT, 'text': msg, 'parse_mode': 'HTML'},
-            timeout=10
-        )
-    except Exception as e:
-        log.warning(f'Telegram error: {e}')
-
-# ── Already-open position check ────────────────────────────────────────────────
-def get_open_symbols():
+def get_open_symbols() -> Set[str]:
+    """Get set of symbols currently held."""
     try:
         positions = get_positions()
         return {p['symbol'] for p in positions}
     except:
         return set()
 
-# ── Core scan loop ─────────────────────────────────────────────────────────────
-def run_scan():
-    log.info('─── Starting scan cycle ───')
+def place_bracket_order(symbol: str, qty: int, side: str, price: float, 
+                       sl_pct: float, tp_pct: float) -> Dict:
+    """
+    Place a bracket order with stop-loss and take-profit.
+    
+    Args:
+        symbol: Stock symbol
+        qty: Number of shares
+        side: 'buy' or 'sell'
+        price: Current price
+        sl_pct: Stop-loss percentage
+        tp_pct: Take-profit percentage
+    """
+    if side == 'buy':
+        stop_price = round(price * (1 - sl_pct / 100), 2)
+        limit_price = round(price * (1 + tp_pct / 100), 2)
+    else:  # sell
+        stop_price = round(price * (1 + sl_pct / 100), 2)
+        limit_price = round(price * (1 - tp_pct / 100), 2)
+    
+    body = {
+        'symbol': symbol,
+        'qty': str(qty),
+        'side': side,
+        'type': 'market',
+        'time_in_force': 'day',
+        'order_class': 'bracket',
+        'stop_loss': {'stop_price': str(stop_price)},
+        'take_profit': {'limit_price': str(limit_price)},
+    }
+    return alpaca_post('/v2/orders', body)
 
+# ── Market Data (Yahoo Finance) ────────────────────────────────────────────────
+def get_quote(symbol: str) -> Optional[Dict]:
+    """
+    Fetch live quote from Yahoo Finance.
+    No API key required, no rate limits.
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        
+        # Get current price from ticker info
+        info = ticker.info
+        
+        # Try multiple possible price fields
+        price = (info.get('regularMarketPrice') or 
+                info.get('currentPrice') or 
+                info.get('ask') or 
+                info.get('bid') or 0)
+        
+        # Get previous close for change percentage
+        prev_close = (info.get('regularMarketPreviousClose') or 
+                     info.get('previousClose') or price)
+        
+        # Fallback to history method if info doesn't have price
+        if price == 0:
+            hist = ticker.history(period='2d', interval='1d')
+            if not hist.empty:
+                price = float(hist['Close'].iloc[-1])
+                if len(hist) > 1:
+                    prev_close = float(hist['Close'].iloc[-2])
+                else:
+                    prev_close = price
+        
+        if price == 0:
+            log.warning(f'{symbol}: Could not fetch price')
+            return None
+        
+        # Calculate change percentage
+        if prev_close and prev_close > 0:
+            change_pct = ((price - prev_close) / prev_close) * 100
+        else:
+            change_pct = 0
+        
+        # Get volume
+        volume = info.get('volume', info.get('regularMarketVolume', 0))
+        
+        log.info(f'✅ {symbol}: ${price:.2f} ({change_pct:+.2f}%) | Vol: {volume:,}')
+        
+        return {
+            'price': price,
+            'change_pct': change_pct,
+            'volume': volume,
+        }
+        
+    except Exception as e:
+        log.error(f'{symbol}: Yahoo Finance error - {str(e)[:100]}')
+        return None
+
+# ── Market Hours Check ─────────────────────────────────────────────────────────
+def market_is_open() -> bool:
+    """Check if the stock market is currently open."""
+    try:
+        clock = alpaca_get('/v2/clock')
+        is_open = clock.get('is_open', False)
+        log.info(f'Market is {"OPEN" if is_open else "CLOSED"}')
+        return is_open
+    except Exception as e:
+        log.warning(f'Could not check market hours: {e}')
+        return True  # Assume open if can't check
+
+# ── Signal Generation ─────────────────────────────────────────────────────────
+def generate_signal(strategy: str, quote: Dict) -> Tuple[str, int, str]:
+    """
+    Generate trading signal based on strategy.
+    
+    Returns:
+        Tuple of (action, confidence, reason)
+        action: 'buy', 'sell', or 'hold'
+        confidence: 0-100
+        reason: Description of the signal
+    """
+    change_pct = quote['change_pct']
+    volume = quote['volume']
+    
+    if strategy == 'momentum':
+        if change_pct > 1.5:
+            confidence = min(95, int(60 + change_pct * 8))
+            return ('buy', confidence, f'Strong momentum +{change_pct:.2f}%')
+        elif change_pct < -1.5:
+            confidence = min(95, int(60 + abs(change_pct) * 8))
+            return ('sell', confidence, f'Weak momentum {change_pct:.2f}%')
+            
+    elif strategy == 'mean_reversion':
+        if change_pct < -2.5:
+            return ('buy', 78, f'Oversold bounce {change_pct:.2f}%')
+        elif change_pct > 2.5:
+            return ('sell', 78, f'Overbought pullback +{change_pct:.2f}%')
+            
+    elif strategy == 'breakout':
+        if change_pct > 2.0 and volume > 5_000_000:
+            return ('buy', 85, f'Breakout with volume {volume/1e6:.1f}M')
+        elif change_pct < -2.0 and volume > 5_000_000:
+            return ('sell', 80, f'Breakdown with volume {volume/1e6:.1f}M')
+            
+    elif strategy == 'swing':
+        if change_pct > 1.0:
+            return ('buy', 72, f'Swing entry +{change_pct:.2f}%')
+        elif change_pct < -1.0:
+            return ('sell', 72, f'Swing exit {change_pct:.2f}%')
+    
+    return ('hold', 40, 'No clear signal')
+
+# ── Telegram Alerts ────────────────────────────────────────────────────────────
+def send_telegram(message: str) -> None:
+    """Send alert message to Telegram."""
+    if not TG_TOKEN or not TG_CHAT:
+        return
+    
+    try:
+        url = f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage'
+        payload = {
+            'chat_id': TG_CHAT,
+            'text': message,
+            'parse_mode': 'HTML'
+        }
+        requests.post(url, json=payload, timeout=10)
+        log.info('📱 Telegram alert sent')
+    except Exception as e:
+        log.warning(f'Telegram error: {e}')
+
+# ── Daily Summary ─────────────────────────────────────────────────────────────
+def send_daily_summary() -> None:
+    """Send daily P&L summary at market close."""
+    try:
+        account = get_account()
+        equity = float(account.get('equity', 0))
+        buying_power = float(account.get('buying_power', 0))
+        daily_pnl = float(account.get('daily_pnl', 0))
+        
+        message = (
+            f'📊 <b>Empire Bot Daily Summary</b>\n'
+            f'┌─────────────────────┐\n'
+            f'│ Equity:     ${equity:,.2f}\n'
+            f'│ Daily P&L:  {"+" if daily_pnl >= 0 else ""}${daily_pnl:,.2f}\n'
+            f'│ Buying Power: ${buying_power:,.2f}\n'
+            f'└─────────────────────┘'
+        )
+        send_telegram(message)
+    except Exception as e:
+        log.error(f'Failed to send daily summary: {e}')
+
+# ── Main Scan Loop ────────────────────────────────────────────────────────────
+def run_scan() -> None:
+    """Execute one scan cycle: check signals and place orders."""
+    log.info('─── Starting scan cycle ───')
+    
+    # Check if market is open
     if not market_is_open():
         log.info('Market is closed — skipping scan')
         return
-
+    
+    # Get currently held symbols
     open_symbols = get_open_symbols()
-    executed = 0
-
+    log.info(f'Currently holding: {open_symbols if open_symbols else "None"}')
+    
+    executed_orders = 0
+    
     for symbol, strategy, max_pos, sl_pct, tp_pct in WATCHLIST:
         try:
+            # Fetch current quote
             quote = get_quote(symbol)
             if not quote:
                 log.warning(f'{symbol}: Could not fetch quote — skipping')
                 continue
-
+            
+            # Generate trading signal
             action, confidence, reason = generate_signal(strategy, quote)
-            price = quote['price']
-            log.info(f'{symbol} [{strategy}]: {action.upper()} {confidence}% — {reason}')
-
-            # Only execute high-confidence signals (≥75%) not already held
-            if action == 'hold' or confidence < 75:
+            current_price = quote['price']
+            
+            log.info(f'{symbol} [{strategy}]: {action.upper()} ({confidence}%) — {reason}')
+            
+            # Skip if no action or low confidence
+            if action == 'hold':
                 continue
-            if symbol in open_symbols and action == 'buy':
+            if confidence < MIN_CONFIDENCE:
+                log.info(f'{symbol}: Confidence {confidence}% < {MIN_CONFIDENCE}% — skipping')
+                continue
+            
+            # Skip buy if already holding
+            if action == 'buy' and symbol in open_symbols:
                 log.info(f'{symbol}: Already holding — skipping buy')
                 continue
-
-            qty = max(1, int(max_pos / price))
-            order = place_bracket_order(symbol, qty, action, price, sl_pct, tp_pct)
-            sl    = round(price * (1 - sl_pct/100) if action == 'buy' else price * (1 + sl_pct/100), 2)
-            tp    = round(price * (1 + tp_pct/100) if action == 'buy' else price * (1 - tp_pct/100), 2)
-
-            log.info(f'✅ BRACKET ORDER PLACED: {action.upper()} {qty}x {symbol} '
-                     f'@ ${price:.2f} | SL ${sl} | TP ${tp} | id={order.get("id","?")}')
-
-            send_telegram(
-                f'🤖 <b>Empire Bot Trade</b>\n'
-                f'{"🟢 BUY" if action=="buy" else "🔴 SELL"} <b>{qty}x {symbol}</b> @ ${price:.2f}\n'
-                f'📉 Stop-Loss: ${sl}  📈 Take-Profit: ${tp}\n'
-                f'Strategy: {strategy} | Confidence: {confidence}%\n'
-                f'Reason: {reason}'
+            
+            # Calculate quantity to trade
+            qty = max(1, int(max_pos / current_price))
+            
+            # Place the order
+            order = place_bracket_order(symbol, qty, action, current_price, sl_pct, tp_pct)
+            
+            # Calculate stop loss and take profit prices
+            if action == 'buy':
+                stop_price = round(current_price * (1 - sl_pct / 100), 2)
+                target_price = round(current_price * (1 + tp_pct / 100), 2)
+            else:
+                stop_price = round(current_price * (1 + sl_pct / 100), 2)
+                target_price = round(current_price * (1 - tp_pct / 100), 2)
+            
+            log.info(f'✅ ORDER PLACED: {action.upper()} {qty}x {symbol} '
+                    f'@ ${current_price:.2f} | SL: ${stop_price} | TP: ${target_price}')
+            
+            # Send Telegram alert
+            alert = (
+                f'🤖 <b>Empire Bot Trade Executed</b>\n'
+                f'{"🟢 BUY" if action == "buy" else "🔴 SELL"} <b>{qty}x {symbol}</b>\n'
+                f'💰 Price: ${current_price:.2f}\n'
+                f'📉 Stop Loss: ${stop_price} ({sl_pct:.1f}%)\n'
+                f'📈 Take Profit: ${target_price} ({tp_pct:.1f}%)\n'
+                f'🎯 Strategy: {strategy} | Confidence: {confidence}%\n'
+                f'📝 Reason: {reason}'
             )
-            executed += 1
-            open_symbols.add(symbol)
-
+            send_telegram(alert)
+            
+            executed_orders += 1
+            open_symbols.add(symbol)  # Update held symbols
+            
+            # Small delay between orders to avoid rate limits
+            time.sleep(1)
+            
         except Exception as e:
-            log.error(f'{symbol}: Error — {e}')
+            log.error(f'{symbol}: Error processing - {e}')
+    
+    log.info(f'─── Scan complete. {executed_orders} order(s) placed ───')
+    
+    # Send daily summary at market close (around 4 PM ET = 20:00 UTC)
+    current_hour = datetime.now(timezone.utc).hour
+    if current_hour == 20 and executed_orders == 0:
+        send_daily_summary()
 
-    log.info(f'─── Scan complete. {executed} order(s) placed ───')
-
-    # Daily summary at ~16:00 UTC (market close)
-    hour = datetime.now(timezone.utc).hour
-    if hour == 16 and executed == 0:
-        try:
-            acct = get_account()
-            equity    = float(acct.get('equity', 0))
-            last_eq   = float(acct.get('last_equity', equity))
-            daily_pnl = equity - last_eq
-            send_telegram(
-                f'📊 <b>Empire Daily Summary</b>\n'
-                f'Equity: ${equity:,.2f}\n'
-                f'Daily P&L: {"+" if daily_pnl >= 0 else ""}${daily_pnl:,.2f}\n'
-                f'Cash: ${float(acct.get("cash", 0)):,.2f}'
-            )
-        except:
-            pass
-
-# ── Health endpoint (keeps Render free tier awake) ─────────────────────────────
-def start_health_server():
-    from flask import Flask
+# ── Health Check Server (Keeps Render awake) ──────────────────────────────────
+def start_health_server() -> None:
+    """Start Flask server for health checks and manual API access."""
     app = Flask(__name__)
-
+    
     @app.route('/health')
     def health():
-        return {'status': 'running', 'bot': 'Empire Trading Bot', 'time': datetime.utcnow().isoformat()}
-
+        return jsonify({
+            'status': 'running',
+            'bot': 'Empire Trading Bot',
+            'time': datetime.now(timezone.utc).isoformat(),
+            'version': '2.0'
+        })
+    
+    @app.route('/')
+    def home():
+        return jsonify({
+            'message': 'Empire Trading Bot is running',
+            'endpoints': ['/health', '/account', '/positions', '/orders', '/quote/<symbol>']
+        })
+    
     @app.route('/account')
     def account():
-        return alpaca_get('/v2/account')
-
+        try:
+            return jsonify(get_account())
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
     @app.route('/positions')
     def positions():
-        return alpaca_get('/v2/positions')
-
+        try:
+            return jsonify(get_positions())
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
     @app.route('/orders')
     def orders():
-        return alpaca_get('/v2/orders?status=all&limit=50')
-
+        try:
+            return jsonify(alpaca_get('/v2/orders?status=all&limit=50'))
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
     @app.route('/quote/<symbol>')
-    def quote(symbol):
-        url = (f'https://www.alphavantage.co/query?function=GLOBAL_QUOTE'
-               f'&symbol={symbol}&apikey={AV_KEY}')
-        r = requests.get(url, timeout=10)
-        return r.json()
-
-    @app.route('/order', methods=['POST'])
-    def order():
-        from flask import request as req
-        return alpaca_post('/v2/orders', req.get_json())
-
-    @app.route('/order/bracket', methods=['POST'])
-    def bracket_order():
-        from flask import request as req
-        return alpaca_post('/v2/orders', req.get_json())
-
+    def quote_endpoint(symbol):
+        try:
+            quote = get_quote(symbol.upper())
+            if quote:
+                return jsonify(quote)
+            return jsonify({'error': 'Could not fetch quote'}), 404
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/scan', methods=['POST'])
+    def manual_scan():
+        """Manually trigger a scan cycle."""
+        try:
+            # Run scan in background thread to not block response
+            thread = threading.Thread(target=run_scan)
+            thread.start()
+            return jsonify({'message': 'Scan triggered'}), 202
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
     port = int(os.environ.get('PORT', 8080))
-    log.info(f'Health server on port {port}')
+    log.info(f'🌐 Health server running on port {port}')
     app.run(host='0.0.0.0', port=port, debug=False)
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── Main Entry Point ──────────────────────────────────────────────────────────
 if __name__ == '__main__':
     log.info('🚀 Empire Trading Bot starting...')
-
+    log.info(f'📊 Watchlist: {len(WATCHLIST)} symbols')
+    log.info(f'⏱️  Scan interval: {SCAN_INTERVAL} seconds')
+    log.info(f'💰 Max position: ${MAX_POSITION_USD:,.2f}')
+    log.info(f'🎯 Min confidence: {MIN_CONFIDENCE}%')
+    
+    # Validate required environment variables
     if not ALPACA_KEY or not ALPACA_SECRET:
-        log.error('❌ ALPACA_API_KEY and ALPACA_SECRET_KEY must be set as environment variables!')
+        log.error('❌ ALPACA_API_KEY and ALPACA_SECRET_KEY must be set!')
+        log.error('Please add these environment variables in Render dashboard')
         exit(1)
-
-    # Health server in background thread
-    threading.Thread(target=start_health_server, daemon=True).start()
-    time.sleep(2)  # let server start
-
-    # Initial scan
+    
+    # Show which Alpaca environment we're using
+    if 'paper' in ALPACA_URL:
+        log.info('📝 Running in PAPER TRADING mode')
+    else:
+        log.warning('⚠️  Running in LIVE TRADING mode!')
+    
+    # Start health server in background
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    time.sleep(2)  # Allow server to start
+    
+    # Send startup notification
+    send_telegram(
+        f'🤖 <b>Empire Trading Bot Started</b>\n'
+        f'📊 Watchlist: {len(WATCHLIST)} symbols\n'
+        f'⏱️  Scan every {SCAN_INTERVAL} seconds\n'
+        f'{"📝 PAPER TRADING" if "paper" in ALPACA_URL else "💰 LIVE TRADING"}'
+    )
+    
+    # Run initial scan
+    log.info('Running initial scan...')
     run_scan()
-
-    # Scan every SCAN_INTERVAL seconds forever
+    
+    # Main loop - scan forever
+    log.info(f'Entering main loop. Will scan every {SCAN_INTERVAL} seconds.')
     while True:
         time.sleep(SCAN_INTERVAL)
         run_scan()
