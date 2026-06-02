@@ -24,7 +24,14 @@ START CMD on Render: python empire_bot.py
 import os, time, logging, threading, json
 from datetime import datetime, timezone
 import requests
-import yfinance as yf
+
+# Try to import yfinance, fall back to Alpha Vantage if not available
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
+    print("WARNING: yfinance not installed. Install with: pip install yfinance")
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -38,6 +45,7 @@ log = logging.getLogger('EmpireBot')
 ALPACA_KEY    = os.environ.get('ALPACA_API_KEY', '')
 ALPACA_SECRET = os.environ.get('ALPACA_SECRET_KEY', '')
 ALPACA_URL    = os.environ.get('ALPACA_BASE_URL', 'https://api.alpaca.markets')
+AV_KEY        = os.environ.get('ALPHAVANTAGE_KEY', '')  # Keep as fallback
 TG_TOKEN      = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TG_CHAT       = os.environ.get('TELEGRAM_CHAT_ID', '')
 SCAN_INTERVAL = int(os.environ.get('SCAN_INTERVAL_SECONDS', '300'))  # 5 min default
@@ -94,38 +102,53 @@ def place_bracket_order(symbol, qty, side, price, sl_pct, tp_pct):
     }
     return alpaca_post('/v2/orders', body)
 
-# ── Market data (FIXED: using Yahoo Finance instead of Alpha Vantage) ─────────
+# ── Market data (using Yahoo Finance) ──────────────────────────────────────────
 def get_quote(symbol):
-    """Fetch live quote from Yahoo Finance (no API key, no rate limits)."""
+    """Fetch live quote from Yahoo Finance."""
+    if not YFINANCE_AVAILABLE:
+        log.error("yfinance not available. Please install: pip install yfinance")
+        return None
+    
     try:
         ticker = yf.Ticker(symbol)
+        
+        # Get current price - try multiple methods
         info = ticker.info
+        price = info.get('regularMarketPrice') or info.get('currentPrice') or info.get('ask') or info.get('bid')
         
-        price = (info.get('regularMarketPrice') or 
-                info.get('currentPrice') or 
-                info.get('ask') or 0)
-        
-        prev_close = (info.get('regularMarketPreviousClose') or 
-                     info.get('previousClose') or price)
-        
-        if price == 0:
-            hist = ticker.history(period='1d')
+        # If info didn't work, try history
+        if not price or price == 0:
+            hist = ticker.history(period='1d', interval='1m')
             if not hist.empty:
-                price = float(hist['Close'].iloc[-1])
+                price = hist['Close'].iloc[-1]
         
-        if price == 0:
+        if not price or price == 0:
+            log.warning(f'{symbol}: Could not get price')
             return None
         
+        # Get previous close for change percentage
+        prev_close = info.get('regularMarketPreviousClose') or info.get('previousClose')
+        if not prev_close:
+            hist = ticker.history(period='2d')
+            if len(hist) >= 2:
+                prev_close = hist['Close'].iloc[-2]
+            else:
+                prev_close = price
+        
+        # Calculate change percentage
         change_pct = ((price - prev_close) / prev_close) * 100 if prev_close else 0
-        volume = info.get('volume', info.get('regularMarketVolume', 0))
+        
+        # Get volume
+        volume = info.get('volume') or info.get('regularMarketVolume') or 0
         
         return {
             'price': price,
             'change_pct': change_pct,
             'volume': volume,
         }
+        
     except Exception as e:
-        log.warning(f'{symbol}: Yahoo Finance error - {e}')
+        log.warning(f'{symbol}: Yahoo Finance error - {str(e)[:100]}')
         return None
 
 # ── Market hours check ─────────────────────────────────────────────────────────
@@ -269,7 +292,7 @@ def start_health_server():
 
     @app.route('/quote/<symbol>')
     def quote(symbol):
-        quote_data = get_quote(symbol)
+        quote_data = get_quote(symbol.upper())
         if quote_data:
             return quote_data
         return {'error': 'Could not fetch quote'}, 404
@@ -295,6 +318,12 @@ if __name__ == '__main__':
     if not ALPACA_KEY or not ALPACA_SECRET:
         log.error('❌ ALPACA_API_KEY and ALPACA_SECRET_KEY must be set as environment variables!')
         exit(1)
+
+    if not YFINANCE_AVAILABLE:
+        log.error('❌ yfinance is not installed. Run: pip install yfinance')
+        exit(1)
+
+    log.info('✅ Using Yahoo Finance for market data')
 
     # Health server in background thread
     threading.Thread(target=start_health_server, daemon=True).start()
