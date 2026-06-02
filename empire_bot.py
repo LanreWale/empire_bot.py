@@ -14,17 +14,17 @@ REQUIRED ENV VARS on Render:
   ALPACA_API_KEY       — Your Alpaca live API key
   ALPACA_SECRET_KEY    — Your Alpaca live secret key
   ALPACA_BASE_URL      — https://api.alpaca.markets
-  ALPHAVANTAGE_KEY     — Alpha Vantage API key (for quotes)
   TELEGRAM_BOT_TOKEN   — Telegram bot token (optional, for alerts)
   TELEGRAM_CHAT_ID     — Your Telegram chat ID (optional)
 
-INSTALL: pip install alpaca-trade-api requests flask
+INSTALL: pip install alpaca-trade-api requests flask yfinance
 START CMD on Render: python empire_bot.py
 """
 
 import os, time, logging, threading, json
 from datetime import datetime, timezone
 import requests
+import yfinance as yf
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -38,7 +38,6 @@ log = logging.getLogger('EmpireBot')
 ALPACA_KEY    = os.environ.get('ALPACA_API_KEY', '')
 ALPACA_SECRET = os.environ.get('ALPACA_SECRET_KEY', '')
 ALPACA_URL    = os.environ.get('ALPACA_BASE_URL', 'https://api.alpaca.markets')
-AV_KEY        = os.environ.get('ALPHAVANTAGE_KEY', '')
 TG_TOKEN      = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TG_CHAT       = os.environ.get('TELEGRAM_CHAT_ID', '')
 SCAN_INTERVAL = int(os.environ.get('SCAN_INTERVAL_SECONDS', '300'))  # 5 min default
@@ -95,22 +94,39 @@ def place_bracket_order(symbol, qty, side, price, sl_pct, tp_pct):
     }
     return alpaca_post('/v2/orders', body)
 
-# ── Market data ────────────────────────────────────────────────────────────────
+# ── Market data (FIXED: using Yahoo Finance instead of Alpha Vantage) ─────────
 def get_quote(symbol):
-    """Fetch live quote from Alpha Vantage."""
-    if not AV_KEY:
+    """Fetch live quote from Yahoo Finance (no API key, no rate limits)."""
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.info
+        
+        price = (info.get('regularMarketPrice') or 
+                info.get('currentPrice') or 
+                info.get('ask') or 0)
+        
+        prev_close = (info.get('regularMarketPreviousClose') or 
+                     info.get('previousClose') or price)
+        
+        if price == 0:
+            hist = ticker.history(period='1d')
+            if not hist.empty:
+                price = float(hist['Close'].iloc[-1])
+        
+        if price == 0:
+            return None
+        
+        change_pct = ((price - prev_close) / prev_close) * 100 if prev_close else 0
+        volume = info.get('volume', info.get('regularMarketVolume', 0))
+        
+        return {
+            'price': price,
+            'change_pct': change_pct,
+            'volume': volume,
+        }
+    except Exception as e:
+        log.warning(f'{symbol}: Yahoo Finance error - {e}')
         return None
-    url = (f'https://www.alphavantage.co/query?function=GLOBAL_QUOTE'
-           f'&symbol={symbol}&apikey={AV_KEY}')
-    r = requests.get(url, timeout=10)
-    data = r.json().get('Global Quote', {})
-    if not data:
-        return None
-    return {
-        'price':          float(data.get('05. price', 0)),
-        'change_pct':     float(data.get('10. change percent', '0%').replace('%', '')),
-        'volume':         int(data.get('06. volume', 0)),
-    }
 
 # ── Market hours check ─────────────────────────────────────────────────────────
 def market_is_open():
@@ -253,10 +269,10 @@ def start_health_server():
 
     @app.route('/quote/<symbol>')
     def quote(symbol):
-        url = (f'https://www.alphavantage.co/query?function=GLOBAL_QUOTE'
-               f'&symbol={symbol}&apikey={AV_KEY}')
-        r = requests.get(url, timeout=10)
-        return r.json()
+        quote_data = get_quote(symbol)
+        if quote_data:
+            return quote_data
+        return {'error': 'Could not fetch quote'}, 404
 
     @app.route('/order', methods=['POST'])
     def order():
