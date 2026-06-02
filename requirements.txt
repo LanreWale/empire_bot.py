@@ -1,3 +1,4 @@
 flask
 requests
 alpaca-trade-api
+yfinance
