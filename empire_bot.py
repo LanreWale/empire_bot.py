@@ -14,24 +14,17 @@ REQUIRED ENV VARS on Render:
   ALPACA_API_KEY       — Your Alpaca live API key
   ALPACA_SECRET_KEY    — Your Alpaca live secret key
   ALPACA_BASE_URL      — https://api.alpaca.markets
+  ALPHAVANTAGE_KEY     — Alpha Vantage API key (REQUIRED for market data)
   TELEGRAM_BOT_TOKEN   — Telegram bot token (optional, for alerts)
   TELEGRAM_CHAT_ID     — Your Telegram chat ID (optional)
 
-INSTALL: pip install alpaca-trade-api requests flask yfinance
+INSTALL: pip install alpaca-trade-api requests flask
 START CMD on Render: python empire_bot.py
 """
 
 import os, time, logging, threading, json
 from datetime import datetime, timezone
 import requests
-
-# Try to import yfinance, fall back to Alpha Vantage if not available
-try:
-    import yfinance as yf
-    YFINANCE_AVAILABLE = True
-except ImportError:
-    YFINANCE_AVAILABLE = False
-    print("WARNING: yfinance not installed. Install with: pip install yfinance")
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -45,7 +38,7 @@ log = logging.getLogger('EmpireBot')
 ALPACA_KEY    = os.environ.get('ALPACA_API_KEY', '')
 ALPACA_SECRET = os.environ.get('ALPACA_SECRET_KEY', '')
 ALPACA_URL    = os.environ.get('ALPACA_BASE_URL', 'https://api.alpaca.markets')
-AV_KEY        = os.environ.get('ALPHAVANTAGE_KEY', '')  # Keep as fallback
+AV_KEY        = os.environ.get('ALPHAVANTAGE_KEY', '')
 TG_TOKEN      = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TG_CHAT       = os.environ.get('TELEGRAM_CHAT_ID', '')
 SCAN_INTERVAL = int(os.environ.get('SCAN_INTERVAL_SECONDS', '300'))  # 5 min default
@@ -102,44 +95,50 @@ def place_bracket_order(symbol, qty, side, price, sl_pct, tp_pct):
     }
     return alpaca_post('/v2/orders', body)
 
-# ── Market data (using Yahoo Finance) ──────────────────────────────────────────
+# ── Market data using Alpha Vantage ────────────────────────────────────────────
 def get_quote(symbol):
-    """Fetch live quote from Yahoo Finance."""
-    if not YFINANCE_AVAILABLE:
-        log.error("yfinance not available. Please install: pip install yfinance")
+    """Fetch live quote from Alpha Vantage API."""
+    if not AV_KEY:
+        log.error(f'❌ ALPHAVANTAGE_KEY not set! Cannot fetch quote for {symbol}')
         return None
     
     try:
-        ticker = yf.Ticker(symbol)
+        url = f'https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={AV_KEY}'
+        response = requests.get(url, timeout=10)
         
-        # Get current price - try multiple methods
-        info = ticker.info
-        price = info.get('regularMarketPrice') or info.get('currentPrice') or info.get('ask') or info.get('bid')
-        
-        # If info didn't work, try history
-        if not price or price == 0:
-            hist = ticker.history(period='1d', interval='1m')
-            if not hist.empty:
-                price = hist['Close'].iloc[-1]
-        
-        if not price or price == 0:
-            log.warning(f'{symbol}: Could not get price')
+        if response.status_code != 200:
+            log.warning(f'{symbol}: Alpha Vantage HTTP {response.status_code}')
             return None
         
-        # Get previous close for change percentage
-        prev_close = info.get('regularMarketPreviousClose') or info.get('previousClose')
-        if not prev_close:
-            hist = ticker.history(period='2d')
-            if len(hist) >= 2:
-                prev_close = hist['Close'].iloc[-2]
-            else:
-                prev_close = price
+        data = response.json()
         
-        # Calculate change percentage
-        change_pct = ((price - prev_close) / prev_close) * 100 if prev_close else 0
+        # Check for API rate limit
+        if 'Note' in data:
+            log.warning(f'{symbol}: Alpha Vantage rate limit reached. Waiting 60 seconds...')
+            time.sleep(60)
+            return None
         
-        # Get volume
-        volume = info.get('volume') or info.get('regularMarketVolume') or 0
+        # Check for error message
+        if 'Error Message' in data:
+            log.warning(f'{symbol}: Alpha Vantage error - {data["Error Message"]}')
+            return None
+        
+        # Extract quote data
+        quote_data = data.get('Global Quote', {})
+        if not quote_data:
+            log.warning(f'{symbol}: No quote data returned')
+            return None
+        
+        # Parse values
+        price = float(quote_data.get('05. price', 0))
+        change_pct = float(quote_data.get('10. change percent', '0%').replace('%', ''))
+        volume = int(quote_data.get('06. volume', 0))
+        
+        if price == 0:
+            log.warning(f'{symbol}: Price is zero')
+            return None
+        
+        log.info(f'✅ {symbol}: ${price:.2f} ({change_pct:+.2f}%) | Vol: {volume:,}')
         
         return {
             'price': price,
@@ -147,8 +146,14 @@ def get_quote(symbol):
             'volume': volume,
         }
         
+    except requests.exceptions.Timeout:
+        log.error(f'{symbol}: Alpha Vantage timeout')
+        return None
+    except requests.exceptions.ConnectionError:
+        log.error(f'{symbol}: Alpha Vantage connection error')
+        return None
     except Exception as e:
-        log.warning(f'{symbol}: Yahoo Finance error - {str(e)[:100]}')
+        log.error(f'{symbol}: Alpha Vantage error - {e}')
         return None
 
 # ── Market hours check ─────────────────────────────────────────────────────────
@@ -216,6 +221,7 @@ def run_scan():
             quote = get_quote(symbol)
             if not quote:
                 log.warning(f'{symbol}: Could not fetch quote — skipping')
+                time.sleep(12)  # Rate limit delay
                 continue
 
             action, confidence, reason = generate_signal(strategy, quote)
@@ -224,9 +230,11 @@ def run_scan():
 
             # Only execute high-confidence signals (≥75%) not already held
             if action == 'hold' or confidence < 75:
+                time.sleep(12)  # Rate limit delay
                 continue
             if symbol in open_symbols and action == 'buy':
                 log.info(f'{symbol}: Already holding — skipping buy')
+                time.sleep(12)  # Rate limit delay
                 continue
 
             qty = max(1, int(max_pos / price))
@@ -246,9 +254,13 @@ def run_scan():
             )
             executed += 1
             open_symbols.add(symbol)
+            
+            # Alpha Vantage rate limit: 5 calls per minute = 12 seconds between calls
+            time.sleep(12)
 
         except Exception as e:
             log.error(f'{symbol}: Error — {e}')
+            time.sleep(12)
 
     log.info(f'─── Scan complete. {executed} order(s) placed ───')
 
@@ -276,7 +288,15 @@ def start_health_server():
 
     @app.route('/health')
     def health():
-        return {'status': 'running', 'bot': 'Empire Trading Bot', 'time': datetime.utcnow().isoformat()}
+        return {
+            'status': 'running', 
+            'bot': 'Empire Trading Bot', 
+            'time': datetime.utcnow().isoformat(),
+            'data_source': 'Alpha Vantage',
+            'alpha_vantage_configured': bool(AV_KEY),
+            'watchlist_size': len(WATCHLIST),
+            'scan_interval': SCAN_INTERVAL
+        }
 
     @app.route('/account')
     def account():
@@ -292,6 +312,7 @@ def start_health_server():
 
     @app.route('/quote/<symbol>')
     def quote(symbol):
+        """Get quote using Alpha Vantage."""
         quote_data = get_quote(symbol.upper())
         if quote_data:
             return quote_data
@@ -314,25 +335,53 @@ def start_health_server():
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     log.info('🚀 Empire Trading Bot starting...')
-
+    log.info('=' * 50)
+    
+    # Validate Alpha Vantage API key
+    if not AV_KEY:
+        log.error('❌ ALPHAVANTAGE_KEY environment variable is REQUIRED!')
+        log.error('   Get a free API key at: https://www.alphavantage.co/support/#api-key')
+        log.error('   Then add it to your Render environment variables.')
+        exit(1)
+    else:
+        log.info('✅ Alpha Vantage API key configured')
+    
+    # Validate Alpaca credentials
     if not ALPACA_KEY or not ALPACA_SECRET:
-        log.error('❌ ALPACA_API_KEY and ALPACA_SECRET_KEY must be set as environment variables!')
+        log.error('❌ ALPACA_API_KEY and ALPACA_SECRET_KEY must be set!')
         exit(1)
-
-    if not YFINANCE_AVAILABLE:
-        log.error('❌ yfinance is not installed. Run: pip install yfinance')
-        exit(1)
-
-    log.info('✅ Using Yahoo Finance for market data')
-
-    # Health server in background thread
+    else:
+        log.info('✅ Alpaca API credentials configured')
+    
+    # Display configuration
+    log.info(f'📊 Market Data Source: Alpha Vantage')
+    log.info(f'⏱️ Scan interval: {SCAN_INTERVAL} seconds')
+    log.info(f'📋 Watchlist: {len(WATCHLIST)} symbols - {", ".join([s[0] for s in WATCHLIST])}')
+    log.info(f'⚠️  Alpha Vantage free tier: 5 API calls per minute')
+    log.info(f'⏲️  Estimated scan time: ~{len(WATCHLIST) * 12} seconds with rate limiting')
+    log.info('=' * 50)
+    
+    # Send startup notification via Telegram
+    if TG_TOKEN and TG_CHAT:
+        send_telegram(
+            f'🤖 <b>Empire Trading Bot Started</b>\n'
+            f'📊 Data Source: Alpha Vantage\n'
+            f'⏱️ Scan every {SCAN_INTERVAL} seconds\n'
+            f'📋 Watching {len(WATCHLIST)} symbols\n'
+            f'💰 Trading Mode: LIVE'
+        )
+    
+    # Start health server in background thread
+    log.info('Starting health server...')
     threading.Thread(target=start_health_server, daemon=True).start()
-    time.sleep(2)  # let server start
-
-    # Initial scan
+    time.sleep(2)
+    
+    # Run initial scan
+    log.info('Running initial scan...')
     run_scan()
-
-    # Scan every SCAN_INTERVAL seconds forever
+    
+    # Main loop
+    log.info(f'Entering main loop. Will scan every {SCAN_INTERVAL} seconds.')
     while True:
         time.sleep(SCAN_INTERVAL)
         run_scan()
